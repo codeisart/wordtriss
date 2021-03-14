@@ -7,6 +7,7 @@
 #include <vector>
 #include <list>
 #include <chrono>
+#include <assert.h>
 
 std::vector<std::vector<std::string>> gWords(100);
 const char* ws = " \t\n\r\f\v";
@@ -30,6 +31,27 @@ inline std::string& trim(std::string& s, const char* t = ws)
 {
 	return ltrim(rtrim(s, t), t);
 }
+
+void drawClipped(WINDOW* win, int y, int x, std::string msg)
+{
+	int maxy, maxx;
+	getmaxyx(win, maxy, maxx);
+	int len= msg.size();
+	if( x < 0 )
+	{
+		int leftclip = -x;
+		msg = msg.substr(leftclip);
+		x = 0;
+	}		
+	else if ( x+len >= maxx ) 
+	{
+		int rightclip = x+len - maxx;
+		msg = msg.substr(0, len-rightclip);
+		//fprintf(stderr, "x=%d, len=%d, maxx=%d, rightclip=%d\n", x,len,maxx,rightclip);
+	}
+	mvwprintw(win,y,x, "%s", msg.c_str());
+}
+
 
 static bool endsWith(const std::string& str, const std::string& suffix)
 {
@@ -71,9 +93,13 @@ struct Round
 	int minSpeed,maxSpeed;  // Per sec.
 	int minWords,maxWords;
 	float makeDelayMin;
+	int levelUpScore;
 } gRounds[] = {
-	{4,8,6,7,4,8,1}, 
-	{2,6,1,3,5,10,0.5}
+	{ 4,   8,  3,  6,  4,    8,  1.0f,  50   }, 
+	{ 6,  10,  4,  8,  6,   10,  0.5f,  100  },
+	{ 8,  12,  6, 12,  8,   10,  0.25f, 150  },
+	{10,  13,  8, 14,  10,  10,  0.1f,  200  },
+	{11,  14, 10, 16,  11,  10,  0.05f, 250  },
 };
 int gLevel=0; 
 bool gQuit = 0;
@@ -92,21 +118,40 @@ struct State
 	State operator*(double a) const { return *this; }
 	State operator+(const State& rhs) const { return *this; }
 
+	WINDOW* board = nullptr;
+	WINDOW* scoreboard = nullptr;
 	std::vector<int> ycache;
 	using ActiveWords = std::list<Word>;
 	std::list<Word> lines;
 	float makeDelayRemaining = 0.f;
 	std::string inputStr;
+	int score = 0;
+	enum EState { eStart,eNewLevel,eGamePlay};
+	EState state = eStart;
+	float stateDelay = 0;
+
+	void init()
+	{
+		int maxy, maxx;
+		getmaxyx(stdscr, maxy, maxx);
+		board = newwin(maxy-1,maxx, 0,0);
+		scoreboard = newwin(1,maxy-1,maxx,0);
+	}
+	void deinit()
+	{
+		delwin(board);
+		delwin(scoreboard);
+	}
 
 	int chooseY()
 	{
 		int maxy,maxx;
-		getmaxyx(stdscr, maxy, maxx);
+		getmaxyx(board, maxy, maxx);
 		int y = rand()%maxy;
-		if( y < ycache.size()-1 ) ycache.resize(y+1);
+		if( y >= ycache.size() ) ycache.resize(y);
 		for( ; y < maxy; ++y)
 		{
-			if(!ycache[y])
+			if(ycache[y]<=0)
 			{
 				ycache[y]++;
 				return y;
@@ -124,14 +169,17 @@ struct State
 	void makeWords(double t, double dt)
 	{
 		Round& r = gRounds[gLevel];
-		int maxy, maxx;
 		makeDelayRemaining -= dt;
 		if( makeDelayRemaining > 0.f )
 			return;
 		makeDelayRemaining = r.makeDelayMin;
 
-		getmaxyx(stdscr, maxy, maxx);
-	
+		if( score >= gRounds[gLevel].levelUpScore )
+			return;
+	   	
+		int maxx,maxy;
+		getmaxyx(board, maxy, maxx);
+		
 		// new a new word?
 		if(lines.size() < r.minWords)
 		{
@@ -140,7 +188,7 @@ struct State
 			int rndWord = rand() % gWords[wordLen].size()-1;
 			const std::string& word = gWords[wordLen][rndWord];
 			Word w( chooseY(), 
-				static_cast<int>(maxx + word.size()), 
+				static_cast<int>(maxx-1 + word.size()), 
 				speed, 
 				word );
 			lines.push_back(w);
@@ -149,11 +197,32 @@ struct State
 	void render()
 	{
 		clear();
-		for(auto& i : lines)
+
+		int maxy,maxx;
+		getmaxyx(board, maxy, maxx);
+		switch(state)
 		{
-			 mvprintw(i.ypos, (int)i.xpos, "%s", i.word.c_str());
+			default: break;
+			case eNewLevel:
+			{
+				if( gLevel != 0 )
+					mvwprintw(board,(maxy/2)-1, (maxx/2)-7, "CONGRATULATIONS" );
+
+				mvwprintw(board,maxy/2, (maxx/2)-4, "LEVEL %d", gLevel+1);
+				break;
+			}
+			case eGamePlay:
+			{
+				for(auto& i : lines)
+				{
+					drawClipped(board,i.ypos, (int)i.xpos, i.word);
+				}
+				mvwprintw(scoreboard,0, 0, "Score: %d, Level: %d", score, gLevel+1);
+				break;
+			}
 		}
-		refresh();
+		wrefresh(board);
+		wrefresh(scoreboard);
 	}
 	void moveWords(double t, double dt)
 	{
@@ -163,6 +232,7 @@ struct State
 			i->xpos -= deltaSpeed;
 			if(i->xpos <= -((float)i->word.size()) ) 
 			{
+				assert(ycache[i->ypos] > 0);
 				ycache[i->ypos]--;
 				i=lines.erase(i);
 			}
@@ -180,7 +250,7 @@ struct State
 				ycache[i->ypos]--;
 				i=lines.erase(i);
 				inputStr.clear();
-		
+				score += i->word.size()-1;
 			}
 			else 
 				i++;
@@ -191,7 +261,9 @@ struct State
 	{
 		char c = getch();
 		if( (c >= 'a' && c <= 'z') ||
-		    (c >= 'A' && c <= 'Z') )
+		    (c >= 'A' && c <= 'Z') || 
+		    c == '\'' || c == '-' || c == '.' 
+		    )
 		{
 			inputStr.push_back(c);
 			checkInputAgainstBoard();
@@ -200,19 +272,43 @@ struct State
 		{
 			gQuit = true;
 			endwin();
-			printf("%s\n",inputStr.c_str());
 			exit(0);
 		}
 	}
 
 	void tick(double t, double dt)
 	{
-		handleInput();
+		switch(state)
+		{
+			case eStart:
+			{
+				state = eNewLevel;
+				stateDelay = 3.0f;
+			}
+			case eNewLevel:
+			{
+				if(stateDelay>0.0f)
+				{
+					stateDelay -= dt;
+					break;
+				}
+				state=eGamePlay;
+			}
+			case eGamePlay:
+			{
+				handleInput();
+				makeWords(t, dt);
+				moveWords(t, dt);
 
-		// make new words.
-		makeWords(t, dt);
-		// move words
-		moveWords(t, dt);
+				if( score >= gRounds[gLevel].levelUpScore &&lines.size() == 0)  
+				{
+					gLevel++;
+					state = eNewLevel;	
+					stateDelay = 3.0f;
+				}
+				break;
+			}
+		}
 	}
 }gBoard;
 
@@ -225,7 +321,6 @@ void mainloop()
 
 	//State previousState;
 	//State currentState;
-	//bool quit = false;
 
 	while ( !gQuit )
 	{
@@ -237,8 +332,6 @@ void mainloop()
 		currentTime = newTime;
 		accumulator += frameTime.count();
 
-		//printf("t=%f\n", t);
-		
 		while ( accumulator >= dt )
 		{
 			//previousState = currentState;
@@ -262,6 +355,21 @@ int main(int argc, char** argv)
 	loadWords();
 	
 	initscr();
+#if 0
+	noecho();
+	int maxy,maxx;
+	getmaxyx(stdscr, maxy, maxx);
+	for(int i = 0; i < 50; ++i)
+	{
+		drawClipped(stdscr, 0, maxx-i, "hello world");
+		wrefresh(stdscr);
+		getch();
+		clear();
+	}
+	endwin();
+	return 0;
+#endif 
+
 	cbreak(); 
 	nodelay(stdscr,TRUE);
 	noecho();
@@ -273,9 +381,11 @@ int main(int argc, char** argv)
 	auto seed = std::chrono::high_resolution_clock::now().time_since_epoch().count();
 	srand(seed);
 
+	gBoard.init();
 	mainloop();
 	
 	getch();
+	gBoard.deinit();
 	endwin();
 
 	return 0;
